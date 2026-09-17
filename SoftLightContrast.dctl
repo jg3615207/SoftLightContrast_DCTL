@@ -1,0 +1,170 @@
+// ============================================================================
+//  SoftLightContrast.dctl
+//
+//  The "Layer Mixer -> RGB Mixer Monochrome -> Soft Light" contrast technique,
+//  collapsed into a single node.
+//
+//  Resolve node tree this replaces:
+//
+//      [ color, untouched ] ------\
+//                                  >---- Layer Mixer (Soft Light) ---->
+//      [ RGB Mixer: Monochrome ] -/        + curve/lift on the mono leg
+//
+//  The blend layer is one monochrome (luma) channel, so the identical transfer
+//  curve is applied to R, G and B. A normal contrast control scales each
+//  channel around a pivot, which pushes the channels apart and drags
+//  saturation up with it. Driving the curve from luma alone keeps the chroma
+//  ratios close to the original: contrast without the saturation climb.
+//
+//  WORKING SPACE
+//  Soft Light is defined on [0,1] and hinges at 0.5, so this expects
+//  display-referred, gamma-encoded input (Rec.709 2.4, sRGB, Gamma 2.4...).
+//  Place it where the layer-mixer stack would go: AFTER a CST / input LUT,
+//  never directly on log or linear. Use Pivot if your mid-grey sits elsewhere.
+// ============================================================================
+
+DEFINE_UI_PARAMS(uStrength, Contrast Strength, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
+DEFINE_UI_PARAMS(uPivot, Pivot, DCTLUI_SLIDER_FLOAT, 0.5, 0.15, 0.85, 0.005)
+DEFINE_UI_PARAMS(uShadow, Shadow Lift, DCTLUI_SLIDER_FLOAT, 0.0, -0.5, 0.5, 0.005)
+DEFINE_UI_PARAMS(uHigh, Highlight Recover, DCTLUI_SLIDER_FLOAT, 0.0, -0.5, 0.5, 0.005)
+DEFINE_UI_PARAMS(uSat, Post Saturation, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.01)
+DEFINE_UI_PARAMS(uMix, Mix, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(uLuma, Luma Weights, DCTLUI_COMBO_BOX, 0, {LUMA_709, LUMA_2020, LUMA_AVG}, {Rec709, Rec2020, Average})
+DEFINE_UI_PARAMS(uModel, Soft Light Model, DCTLUI_COMBO_BOX, 0, {SL_PS, SL_PEGTOP, SL_ILL}, {Photoshop, Pegtop, Illusions})
+DEFINE_UI_PARAMS(uPreserve, Keep Out Of Range, DCTLUI_CHECK_BOX, 1)
+
+// ---------------------------------------------------------------- helpers --
+
+__DEVICE__ float lerpf(float a, float b, float t)
+{
+    return a + (b - a) * t;
+}
+
+// W3C / Photoshop soft light. This is the one Resolve's composite mode matches.
+__DEVICE__ float softLightPS(float b, float s)
+{
+    if (s <= 0.5f)
+    {
+        return b - (1.0f - 2.0f * s) * b * (1.0f - b);
+    }
+    float d = (b <= 0.25f) ? ((16.0f * b - 12.0f) * b + 4.0f) * b : _sqrtf(b);
+    return b + (2.0f * s - 1.0f) * (d - b);
+}
+
+// Pegtop: continuous first derivative, no kink at s = 0.5. Slightly gentler.
+__DEVICE__ float softLightPegtop(float b, float s)
+{
+    return (1.0f - 2.0f * s) * b * b + 2.0f * s * b;
+}
+
+// Illusions.hu: pure gamma remap. Strongest of the three in the deep shadows.
+__DEVICE__ float softLightIllusions(float b, float s)
+{
+    return _powf(b, _powf(2.0f, 2.0f * (0.5f - s)));
+}
+
+__DEVICE__ float softLight(float b, float s, int model)
+{
+    if (model == SL_PEGTOP) return softLightPegtop(b, s);
+    if (model == SL_ILL)    return softLightIllusions(b, s);
+    return softLightPS(b, s);
+}
+
+__DEVICE__ float3 lumaWeights(int mode)
+{
+    if (mode == LUMA_2020) return make_float3(0.2627f, 0.6780f, 0.0593f);
+    if (mode == LUMA_AVG)  return make_float3(1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f);
+    return make_float3(0.2126f, 0.7152f, 0.0722f);
+}
+
+__DEVICE__ float lumaOf(float3 c, float3 w)
+{
+    return c.x * w.x + c.y * w.y + c.z * w.z;
+}
+
+// One pass of the layer-mixer stack: build the mono leg, shape it, soft light
+// it over the colour leg.
+__DEVICE__ float3 softLightPass(float3 base, float3 w, float pivot,
+                                float shadow, float high, int model, int keepRange)
+{
+    // ---- the RGB Mixer "Monochrome" leg -----------------------------------
+    float m = _clampf(lumaOf(base, w), 0.0f, 1.0f);
+
+    // Pivot: remap the blend layer so the soft-light hinge lands on `pivot`
+    // instead of 0.5. pivot = 0.5 leaves it untouched.
+    if (pivot != 0.5f)
+    {
+        m = _powf(m, _logf(0.5f) / _logf(pivot));
+    }
+
+    // ---- curve on highlights, lift wheel on shadows, mono leg only --------
+    // Shadow Lift raises the blend layer's blacks, which soft-lights the
+    // shadows back up. Highlight Recover does the same at the top.
+    m = m + shadow * (1.0f - m) * (1.0f - m);
+    m = m + high * m * m;
+    m = _clampf(m, 0.0f, 1.0f);
+
+    // ---- Layer Mixer, composite mode Soft Light ---------------------------
+    float3 bc = make_float3(_clampf(base.x, 0.0f, 1.0f),
+                            _clampf(base.y, 0.0f, 1.0f),
+                            _clampf(base.z, 0.0f, 1.0f));
+
+    float3 out = make_float3(softLight(bc.x, m, model),
+                             softLight(bc.y, m, model),
+                             softLight(bc.z, m, model));
+
+    // Soft Light is only defined on [0,1]. Rather than crushing superwhites and
+    // sub-blacks, carry the excursion through untouched.
+    if (keepRange)
+    {
+        out.x += base.x - bc.x;
+        out.y += base.y - bc.y;
+        out.z += base.z - bc.z;
+    }
+    return out;
+}
+
+// -------------------------------------------------------------- transform --
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y,
+                            float p_R, float p_G, float p_B)
+{
+    float3 src = make_float3(p_R, p_G, p_B);
+
+    float3 w = lumaWeights(uLuma);
+    float3 col = src;
+
+    // Strength above 1.0 stacks a second layer-mixer node, the way you would
+    // in the node graph, rather than exaggerating a single blend.
+    if (uStrength > 0.0f)
+    {
+        float s1 = _fminf(uStrength, 1.0f);
+        float3 p1 = softLightPass(col, w, uPivot, uShadow, uHigh, uModel, uPreserve);
+        col = make_float3(lerpf(col.x, p1.x, s1),
+                          lerpf(col.y, p1.y, s1),
+                          lerpf(col.z, p1.z, s1));
+
+        if (uStrength > 1.0f)
+        {
+            float s2 = uStrength - 1.0f;
+            float3 p2 = softLightPass(col, w, uPivot, uShadow, uHigh, uModel, uPreserve);
+            col = make_float3(lerpf(col.x, p2.x, s2),
+                              lerpf(col.y, p2.y, s2),
+                              lerpf(col.z, p2.z, s2));
+        }
+    }
+
+    // ---- the separate saturation node that follows in his tree ------------
+    if (uSat != 1.0f)
+    {
+        float y = lumaOf(col, w);
+        col = make_float3(y + (col.x - y) * uSat,
+                          y + (col.y - y) * uSat,
+                          y + (col.z - y) * uSat);
+    }
+
+    // ---- node key output gain equivalent ----------------------------------
+    return make_float3(lerpf(src.x, col.x, uMix),
+                       lerpf(src.y, col.y, uMix),
+                       lerpf(src.z, col.z, uMix));
+}
