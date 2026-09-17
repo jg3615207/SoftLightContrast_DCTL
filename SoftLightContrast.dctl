@@ -84,8 +84,7 @@ __DEVICE__ float lumaOf(float3 c, float3 w)
 
 // One pass of the layer-mixer stack: build the mono leg, shape it, soft light
 // it over the colour leg.
-__DEVICE__ float3 softLightPass(float3 base, float3 w, float pivot,
-                                float shadow, float high, int model, int keepRange)
+__DEVICE__ float3 softLightPass(float3 base, float3 w, float pivot, float shadow, float high, int model, int keepRange)
 {
     // ---- the RGB Mixer "Monochrome" leg -----------------------------------
     float m = _clampf(lumaOf(base, w), 0.0f, 1.0f);
@@ -126,12 +125,11 @@ __DEVICE__ float3 softLightPass(float3 base, float3 w, float pivot,
 
 // -------------------------------------------------------------- transform --
 
-__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y,
-                            float p_R, float p_G, float p_B)
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
 {
     float3 src = make_float3(p_R, p_G, p_B);
 
-    float3 w = lumaWeights(uLuma);
+    float3 w = lumaWeights((int)uLuma);
     float3 col = src;
 
     // Strength above 1.0 stacks a second layer-mixer node, the way you would
@@ -139,7 +137,7 @@ __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y,
     if (uStrength > 0.0f)
     {
         float s1 = _fminf(uStrength, 1.0f);
-        float3 p1 = softLightPass(col, w, uPivot, uShadow, uHigh, uModel, uPreserve);
+        float3 p1 = softLightPass(col, w, uPivot, uShadow, uHigh, (int)uModel, (int)uPreserve);
         col = make_float3(lerpf(col.x, p1.x, s1),
                           lerpf(col.y, p1.y, s1),
                           lerpf(col.z, p1.z, s1));
@@ -147,7 +145,7 @@ __DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y,
         if (uStrength > 1.0f)
         {
             float s2 = uStrength - 1.0f;
-            float3 p2 = softLightPass(col, w, uPivot, uShadow, uHigh, uModel, uPreserve);
+            float3 p2 = softLightPass(col, w, uPivot, uShadow, uHigh, (int)uModel, (int)uPreserve);
             col = make_float3(lerpf(col.x, p2.x, s2),
                               lerpf(col.y, p2.y, s2),
                               lerpf(col.z, p2.z, s2));
